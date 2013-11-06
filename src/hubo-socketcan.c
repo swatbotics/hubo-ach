@@ -57,6 +57,7 @@ static int openCAN(char* name) {
 	/* Create the socket */
 	int skt = socket( PF_CAN, SOCK_RAW, CAN_RAW );
 
+
 	/* Locate the interface you wish to use */
 	struct ifreq ifr;
 	//strcpy(ifr.ifr_name, "vcan0");
@@ -70,6 +71,27 @@ static int openCAN(char* name) {
 	addr.can_family = AF_CAN;
 	addr.can_ifindex = ifr.ifr_ifindex;
 	bind( skt, (struct sockaddr*)&addr, sizeof(addr) );
+
+        int bufsz = 0, tmp; // tmp will hold sizeof(int)
+	if (getsockopt(skt, SOL_SOCKET, SO_RCVBUF, &bufsz, &tmp) != 0) {
+            perror("getsockopt");
+        } else {
+            fprintf(stderr, "getsockopt says SO_RCVBUF=%d\n", bufsz);
+        }
+
+        bufsz = 32 * 16;
+        
+        if (setsockopt(skt, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz)) != 0) {
+            perror("setsockopt");
+        }
+
+	if (getsockopt(skt, SOL_SOCKET, SO_RCVBUF, &bufsz, &tmp) != 0) {
+            perror("getsockopt");
+        } else {
+            fprintf(stderr, "getsockopt says SO_RCVBUF=%d\n", bufsz);
+        }
+        
+
 	return skt;
 }
 
