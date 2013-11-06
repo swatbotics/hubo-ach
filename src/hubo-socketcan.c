@@ -79,6 +79,7 @@ static int openCAN(char* name) {
             fprintf(stderr, "getsockopt says SO_RCVBUF=%d\n", bufsz);
         }
 
+        /*
         bufsz = 32 * 16;
         
         if (setsockopt(skt, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz)) != 0) {
@@ -90,6 +91,7 @@ static int openCAN(char* name) {
         } else {
             fprintf(stderr, "getsockopt says SO_RCVBUF=%d\n", bufsz);
         }
+        */
         
 
 	return skt;
