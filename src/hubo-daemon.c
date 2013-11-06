@@ -449,8 +449,6 @@ void pump_message_loop(hubo_can_t write_skt,
 
         } // if select returned > 0
 
-
-        // TODO: handle timeout and deadline and stuff
         clock_gettime(CLOCK_MONOTONIC, &current_time);
         remaining_time_nsec = tsdiff(&deadline_time, &current_time);
 
