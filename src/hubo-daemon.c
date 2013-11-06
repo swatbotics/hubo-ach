@@ -299,53 +299,96 @@ int64_t tsdiff(const struct timespec* b,
 extern int have_iotrace_chan;
 extern ach_channel_t iotrace_chan;
 
-enum {
-    BAIL_ON_READ = 1,
-    NOBAIL_ON_READ = 0
-};
 
-/* loop until timeout or a write happens, all the while dispatching the reads */
+
+const int64_t write_retry_timeout_nsec = 50 * 1000; // 50 us
+const int64_t write_total_timeout_nsec = 1  * (int64_t)NSEC_PER_SEC; // 1s
+
+/* two different semantics:
+
+      if write_frame non-NULL, this writes (and reads) until the frame
+      was successfully written (and no new frames to be instantly
+      read) or func_max_timeout_nsec expires
+
+      if write_frame NULL, this reads until func_max_timeout_nsec 
+      expires
+
+ */
+
 void pump_message_loop(hubo_can_t write_skt,
                        const struct can_frame* write_frame,
-                       double timeoutD,
-                       int bail_on_read) {
-
+                       int64_t func_max_timeout_nsec) {
     
-    struct timespec current_time, deadline_time;
-
-    int64_t remaining_time_nsec = (int64_t)(timeoutD * NSEC_PER_SEC);
-
-    clock_gettime(CLOCK_MONOTONIC, &current_time);
-    tsadd(&current_time, remaining_time_nsec, &deadline_time);
-
     int max_fd_plus_one =  1 + ( hubo_socket[0] > hubo_socket[1] ? 
                                  hubo_socket[0] : hubo_socket[1] );
 
 
-    while (remaining_time_nsec > 0) {
+    struct timespec current_time, deadline_time;
 
-        fd_set read_fds, write_fds;
+    clock_gettime(CLOCK_MONOTONIC, &current_time);
+    tsadd(&current_time, func_max_timeout_nsec, &deadline_time);
+
+    int64_t remaining_time_nsec = tsdiff(&deadline_time, &current_time);
+
+    int write_success = 0;
+    
+    do {
+
+        int64_t timeout_nsec = remaining_time_nsec;
+
+        // do write first
+        if (write_skt >= 0 && write_frame != NULL) {
+
+            errno = 0;
+            ssize_t bytes_written = write(write_skt, write_frame, 
+                                          sizeof(*write_frame));
+            int write_errno = errno;
+
+            if (have_iotrace_chan) {
+                io_trace_t trace;
+                trace.timestamp = iotrace_gettime();
+                trace.is_read = 0;
+                trace.fd = write_skt;
+                trace.result_errno = write_errno;
+                trace.transmitted = bytes_written;
+                trace.frame = *write_frame;
+                ach_put(&iotrace_chan, &trace, sizeof(trace));
+            }
+                
+            if (bytes_written != sizeof(*write_frame)) {
+
+                if (write_errno != ENOBUFS) {
+                    errno = write_errno;
+                    perror("write in pump_message_loop");
+                }
+                timeout_nsec = write_retry_timeout_nsec;
+
+            } else {
+                // successfully wrote, so subsequent select
+                // should just poll
+                write_skt = -1;
+                write_frame = NULL;
+                timeout_nsec = 0;
+                write_success = 1;
+            }
+
+        }
+
+        fd_set read_fds;
 
         // try to read everything
         FD_ZERO(&read_fds);
         FD_SET(hubo_socket[0], &read_fds);
         FD_SET(hubo_socket[1], &read_fds);
 
-        // only write if we have a message provided
-        FD_ZERO(&write_fds);
-
-        if (write_skt >= 0 && write_frame != NULL) {
-            FD_SET(write_skt, &write_fds);
-        }
-
         // set our timeout
         struct timespec timeout;
-        timeout.tv_sec = remaining_time_nsec / (int64_t)NSEC_PER_SEC;
-        timeout.tv_nsec = remaining_time_nsec % (int64_t)NSEC_PER_SEC;
+        timeout.tv_sec = timeout_nsec / (int64_t)NSEC_PER_SEC;
+        timeout.tv_nsec = timeout_nsec % (int64_t)NSEC_PER_SEC;
 
         errno = 0;
         int result = pselect(max_fd_plus_one, 
-                             &read_fds, &write_fds, NULL, 
+                             &read_fds, NULL, NULL, 
                              &timeout, NULL);
 
         if (result < 0) {
@@ -358,82 +401,60 @@ void pump_message_loop(hubo_can_t write_skt,
 
             // handle reads
             int i;
-            int did_read = 0;
 
             for (i=0; i<2; ++i) {
                 if (FD_ISSET(hubo_socket[i], &read_fds)) {
 
-                    errno = 0;
-                    struct can_frame frame;
-                    ssize_t bytes_read = read(hubo_socket[i], &frame, sizeof(frame));
-                    int read_errno = errno;
+                    int read_errno = 0;
+
+                    do {
+
+                        errno = 0;
+                        struct can_frame frame;
+                        ssize_t bytes_read = recv(hubo_socket[i], &frame, 
+                                                  sizeof(frame), MSG_DONTWAIT);
+                        read_errno = errno;
+                        
+                        if (have_iotrace_chan) {
+                            io_trace_t trace;
+                            trace.timestamp = iotrace_gettime();
+                            trace.is_read = 1;
+                            trace.fd = hubo_socket[i];
+                            trace.result_errno = read_errno;
+                            trace.transmitted = bytes_read;
+                            trace.frame = frame;
+                            ach_put(&iotrace_chan, &trace, sizeof(trace));
+                        }
                     
-                    if (have_iotrace_chan) {
-                        io_trace_t trace;
-                        trace.timestamp = iotrace_gettime();
-                        trace.is_read = 1;
-                        trace.fd = hubo_socket[i];
-                        trace.result_errno = read_errno;
-                        trace.transmitted = bytes_read;
-                        trace.frame = frame;
-                        ach_put(&iotrace_chan, &trace, sizeof(trace));
-                    }
-                    
-          
-                    if (bytes_read != sizeof(frame)) {
-                        errno = read_errno;
-                        perror("read in pump_message_loop");
-                    } else {
-                        did_read = 1;
-                        decodeFrame(global_loop_state,
-                                    global_loop_param,
-                                    &frame);
-                    }
+                        if (bytes_read != sizeof(frame)) {
 
-                }
-            }
+                            if (read_errno != EAGAIN && read_errno != EWOULDBLOCK) {
+                                errno = read_errno;
+                                perror("read in pump_message_loop");
+                            }
+                            
+                        } else {
 
-            // handle write
-            if (write_skt >= 0 && 
-                write_frame != NULL && 
-                FD_ISSET(write_skt, &write_fds)) {
-                
-                errno = 0;
-                ssize_t bytes_written = write(write_skt, write_frame, 
-                                              sizeof(*write_frame));
-                int write_errno = errno;
+                            decodeFrame(global_loop_state,
+                                        global_loop_param,
+                                        &frame);
 
-                if (have_iotrace_chan) {
-                    io_trace_t trace;
-                    trace.timestamp = iotrace_gettime();
-                    trace.is_read = 0;
-                    trace.fd = write_skt;
-                    trace.result_errno = write_errno;
-                    trace.transmitted = bytes_written;
-                    trace.frame = *write_frame;
-                    ach_put(&iotrace_chan, &trace, sizeof(trace));
-                }
-                
-                if (bytes_written != sizeof(*write_frame)) {
-                    errno = write_errno;
-                    perror("write in pump_message_loop");
-                } else {
-                    // did our write successfully
-                    return;
-                }
+                        }
 
-            }
+                    } while (read_errno == 0);
 
-            if (bail_on_read && did_read) {
-                return;
-            }
+                } // ready to read
+            } // for each fd
 
-        }
 
+        } // if select returned > 0
+
+
+        // TODO: handle timeout and deadline and stuff
         clock_gettime(CLOCK_MONOTONIC, &current_time);
         remaining_time_nsec = tsdiff(&deadline_time, &current_time);
 
-    }
+    } while (remaining_time_nsec > 0 && !write_success);
 
     if (write_skt >= 0 && write_frame != NULL) {
         
@@ -451,14 +472,15 @@ void pump_message_loop(hubo_can_t write_skt,
 void meta_readCan(hubo_can_t skt,
                   struct can_frame* f,
                   double timeoutD) {
-    const double short_read_timeout_sec = 0.0; // 20us
-    pump_message_loop(-1, NULL, short_read_timeout_sec, NOBAIL_ON_READ);
+
+
 }
 
 void meta_sendCan(hubo_can_t skt,
                   struct can_frame* f) {
-    const double long_write_timeout_sec = 0.050; // 50ms
-    pump_message_loop(skt, f, long_write_timeout_sec, NOBAIL_ON_READ);
+
+    pump_message_loop(skt, f, write_total_timeout_nsec);
+
 }
 
 
@@ -727,52 +749,7 @@ void huboLoop(hubo_param_t *H_param, int vflag) {
 
         if (loop_remaining_nsec > 0) {
 
-            if (retry_encoders) {
-
-                int c[HUBO_JMC_COUNT];
-                memset( &c, 0, sizeof(c));
-
-                for (i=0; i<HUBO_JOINT_COUNT; ++i) {
-
-                    int jmc = H_param->joint[i].jmc;
-
-                    if (c[jmc] == 0 && 
-                        H_state.joint[i].active && 
-                        !global_loop_enc_valid[i]) {
-
-                        c[jmc] = 1;
-
-                        struct can_frame frame;
-
-                        hGetEncValue(i, 0x00, H_param, &frame);
-
-                        meta_readCan(hubo_socket[H_param->joint[i].can], &frame, 
-                                     HUBO_CAN_TIMEOUT_DEFAULT);
-
-                        if(RF1 == i | RF2 == i | RF3 == i | RF4 == i | RF5 == i | 
-                           LF1 == i | LF2 == i | LF3 == i | LF4 == i | LF5 == i) { 	
-
-                            hGetEncValue(i, 0x01, H_param, &frame);
-                            meta_readCan(hubo_socket[H_param->joint[i].can], &frame, 
-                                         HUBO_CAN_TIMEOUT_DEFAULT);
-
-                        }
-
-                        clock_gettime( CLOCK_MONOTONIC, &time );
-                        loop_remaining_nsec = tsdiff(&loop_time, &time);
-                        if (loop_remaining_nsec <= 0) {
-                            break;
-                        }
-                    
-                    }
-
-                }
-                
-            }
-
-            if (loop_remaining_nsec > 0) {
-                pump_message_loop(-1, NULL, loop_remaining_nsec*1e-9, NOBAIL_ON_READ);
-            }
+            pump_message_loop(-1, NULL, loop_remaining_nsec);
 
             tsadd(&loop_time, loop_interval_nsec, &loop_time);
 
